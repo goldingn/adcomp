@@ -25,10 +25,15 @@ struct isDouble<double>{
 #define CSKIP(...) __VA_ARGS__
 #define TMB_EXTERN
 #endif
-#ifdef TMB_PRECOMPILE
-#define IF_TMB_PRECOMPILE(...) __VA_ARGS__
+#ifdef TMB_PRECOMPILE_ATOMICS
+#define IF_TMB_PRECOMPILE_ATOMICS(...) __VA_ARGS__
 #else
-#define IF_TMB_PRECOMPILE(...)
+#define IF_TMB_PRECOMPILE_ATOMICS(...)
+#endif
+#ifdef HAVE_PRECOMPILED_ATOMICS
+#define CSKIP_ATOMIC(...) ;
+#else
+#define CSKIP_ATOMIC(...) __VA_ARGS__
 #endif
 
 /* Must come before Rinternals.h */
@@ -40,6 +45,11 @@ struct isDouble<double>{
 #include <R_ext/Print.h>
 #include "Rstream.hpp"
 
+/* Flag to bypass abort() */
+#ifndef TMB_ABORT
+#define TMB_ABORT abort()
+#endif
+
 /* Include the Eigen library. */
 #ifdef TMB_SAFEBOUNDS
 #undef NDEBUG
@@ -50,14 +60,14 @@ void eigen_REprintf(const char* x);
                                   eigen_REprintf(#x);                                                \
                                   eigen_REprintf("\nPlease check your matrix-vector bounds etc., "); \
                                   eigen_REprintf("or run your program through a debugger.\n");       \
-				  abort();}
+				  TMB_ABORT;}
 #define TMBAD_ASSERT2(x,msg)                                            \
 if (!(x)) {                                                             \
   Rcerr << "TMBad assertion failed.\n";                                 \
   Rcerr << "The following condition was not met: " << #x << "\n";       \
   Rcerr << "Possible reason: " msg << "\n";                             \
   Rcerr << "For more info run your program through a debugger.\n";      \
-  abort();                                                              \
+  TMB_ABORT;                                                            \
 }
 #define TMBAD_ASSERT(x) TMBAD_ASSERT2(x,"Unknown")
 #else
@@ -113,6 +123,7 @@ using SparseMatrix = SparseMatrix_rename<T, Flags, StorageIndex>;
 #include "TMBad/compile.hpp"
 #include "TMBad/graph2dot.hpp"
 #include "TMBad/compression.hpp"
+#include "TMBad/ad_blas.hpp"
 #ifndef WITH_LIBTMB
 #include "TMBad/TMBad.cpp"
 #endif
@@ -157,9 +168,10 @@ namespace TMBad {
 #include <R.h>
 #include <Rinternals.h>
 #include "toggle_thread_safe_R.hpp"
-void eigen_REprintf(const char* x)CSKIP({REprintf(x);})
+void eigen_REprintf(const char* x)CSKIP({REprintf("%s",x);})
 
 #include "tmbutils/tmbutils.hpp"
+#include "tmbutils/vectorize.hpp"
 using tmbutils::matrix;
 using tmbutils::vector;
 using CppAD::AD;
@@ -192,11 +204,15 @@ namespace CppAD{
 #include "lgamma.hpp"  // harmless
 #include "start_parallel.hpp"
 #include "tmbutils/newton.hpp" // Newton solver + Laplace used by TransformADFunObject
+#ifndef TMB_SKINNY
 #include "tmb_core.hpp"
+#endif
 #include "distributions_R.hpp"
 #include "convenience.hpp"    // Requires besselK
 #include "tmbutils/tmbutils_extra.hpp"
 #include "tmbutils/R_inla.hpp"
+#include "tmbutils/sparse_matrix_exponential.hpp"
+#include "tmbutils/concat.hpp"
 #include "precompile.hpp" // Must come last
 using tmbutils::array;
 using Eigen::Matrix;
@@ -207,3 +223,5 @@ using Eigen::Array;
 // Nothing more to precompile
 #undef CSKIP
 #define CSKIP(...) __VA_ARGS__
+#undef CSKIP_ATOMIC
+#define CSKIP_ATOMIC(...) __VA_ARGS__

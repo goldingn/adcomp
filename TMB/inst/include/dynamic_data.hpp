@@ -87,7 +87,7 @@ namespace dynamic_data {
                              // forward double
                              SEXP envir = double_to_sexp( tx[0] );
                              const char* nam = double_to_charptr( tx[1] );
-                             SEXP res = findVar(install(nam), envir);
+                             SEXP res = Rf_findVar(Rf_install(nam), envir);
                              ty[0] = sexp_to_double( res );
                              ,
                              // reverse
@@ -109,7 +109,7 @@ namespace dynamic_data {
                                Rf_error("Data update: "
                                         "number of items to replace (%i) "
                                         "does not match replacement length (%i)",
-                                        ty.size(), n);
+                                        (int) ty.size(), n);
                              double* pdata = REAL(data);
                              for (int i = 0; i<n; i++) ty[i] = pdata[i];
                              ,

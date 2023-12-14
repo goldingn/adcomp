@@ -284,7 +284,8 @@ MakeADFun <- function(data, parameters, map=list(),
     dataSanitize <- function(x){
       if(is.list(x)) return( lapply(x, dataSanitize) )
       if(is(x,"sparseMatrix")){
-        x <- as(x,"TsparseMatrix")
+        ## WAS: x <- as(x, "dgTMatrix")
+        x <- as( as(x, "TsparseMatrix"), "generalMatrix")
       }
       else if (is.character(x))
       {
@@ -397,7 +398,7 @@ MakeADFun <- function(data, parameters, map=list(),
   tracemgc <- TRUE
 
   ## dummy assignments better than  "globalVariables(....)"
-  L.created.by.newton <- skipFixedEffects <- spHess <- NULL
+  L.created.by.newton <- skipFixedEffects <- spHess <- altHess <- NULL
 
   ## Disable all tracing information
   beSilent <- function(){
@@ -698,7 +699,7 @@ MakeADFun <- function(data, parameters, map=list(),
   h <- function(theta=par, order=0, hessian, L, ...) {
     if(order == 0) {
       ##logdetH <- determinant(hessian)$mod
-      logdetH <- 2*determinant(L)$mod
+      logdetH <- 2*determinant(L, sqrt=TRUE)$modulus
       ans <- f(theta,order=0) + .5*logdetH - length(random)/2*log(2*pi)
       if(LaplaceNonZeroGradient){
         grad <- f(theta,order=1)[random]
@@ -767,7 +768,7 @@ MakeADFun <- function(data, parameters, map=list(),
         e$ind2 <- lookup(hessian,e$Hfull,random)  ## Note: dim(Hfull)>dim(hessian) !
         if (!silent) cat("Done\n")
       }
-      w <- rep(0,length=length(e$Hfull@x))
+      w <- rep(0,length.out=length(e$Hfull@x))
       w[e$ind2] <- ihessian@x[e$ind1]
       ## Reverse mode evaluate ptr in rangedirection w
       ## now gives .5*tr(Hdot*Hinv) !!
@@ -818,6 +819,13 @@ MakeADFun <- function(data, parameters, map=list(),
     par[random] <- opt$par
     par[-random] <- par.fixed
 
+    ## Use alternative Hessian for log determinant?
+    altHessFlag <- !is.null(altHess)
+    if (altHessFlag) {
+        altHess(TRUE) ## Enable alternative hessian
+        on.exit(altHess(FALSE))
+    }
+
     ## HERE! - update hessian and cholesky
     if(!skipFixedEffects){ ## old way
       hess <- spHess(par) ## Full hessian
@@ -860,7 +868,12 @@ MakeADFun <- function(data, parameters, map=list(),
       grad <- h(par,order=1,hessian=hessian,L=L)
       #res <- grad[-random] - t(grad[random])%*%solve(hess[random,random])%*%hess[random,-random]
       #res <- grad[-random] - t(grad[random])%*%solve(hess[random,])%*%t(hess[-random,])
-
+      if (altHessFlag) {
+          ## Restore original hessian and Cholesky
+          altHess(FALSE) ## Disable alternative hessian
+          hessian <- spHess(par, random=TRUE)
+          updateCholesky(L, hessian)
+      }
       ## Profile case correction. The remaining calculations must be
       ## done with the original hessian (which has been destroyed)
       if(!is.null(profile)){
@@ -964,7 +977,7 @@ MakeADFun <- function(data, parameters, map=list(),
     }
     M.5.log2pi <- -.5* log(2*pi) # = log(1/sqrt(2*pi))
     logdmvnorm <- function(u){
-        logdetH.5 <- determinant(L,logarithm=TRUE)$modulus # = log(det(L)) =  .5 * log(det(H))
+        logdetH.5 <- determinant(L, logarithm=TRUE, sqrt=TRUE)$modulus # = log(det(L)) =  .5 * log(det(H))
         nrow(h)*M.5.log2pi + logdetH.5 - .5*colSums(u*as.matrix(h %*% u))
     }
     eval.target <- function(u,order=0){
@@ -1429,9 +1442,10 @@ precompile <- function(all=TRUE, clean=FALSE, trace=TRUE, get.header=FALSE, ...)
           "#ifndef TMB_H",
           "#define TMB_H",
           "#ifdef TMB_PRECOMPILE",
-          readLines(system.file(paste0("include/tmb_enable_precompile.hpp"), package="TMB")),
+          "#define TMB_PRECOMPILE_ATOMICS"[all],
           "#else",
-          readLines(system.file(paste0("include/tmb_enable_header_only.hpp"), package="TMB")),
+          "#define HAVE_PRECOMPILED_ATOMICS"[all],
+          "#define WITH_LIBTMB",
           "#endif",
           "#include <TMB.hpp>",
           precompileSource()[all],
@@ -1467,8 +1481,8 @@ precompile <- function(all=TRUE, clean=FALSE, trace=TRUE, get.header=FALSE, ...)
           "#undef  TMB_LIB_INIT",
           "#undef  LIB_UNLOAD",
           "#undef  WITH_LIBTMB",
-          "#undef  TMB_PRECOMPILE",
-          "#define TMB_PRECOMPILE 1",
+          "#undef  TMB_PRECOMPILE_ATOMICS",
+          "#define TMB_PRECOMPILE_ATOMICS 1",
           "#pragma message \"Running TMB precompilation...\""[trace],
           "#include <TMB.hpp>"
       )
@@ -1750,7 +1764,7 @@ newton <- function (par,fn,gr,he,
   norm <- function(x) sqrt(sum(x^2))
   fn.history <- numeric(maxit)
   fail <- 0
-  for (i in seq(length=maxit)){
+  for (i in seq_len(maxit)){
     parold <- par
     if(trace>=1)cat("iter:",i," ")
     par <- iterate(par)
@@ -1835,7 +1849,7 @@ sparseHessianFun <- function(obj, skipFixedEffects=FALSE) {
            i = as.integer(attr(ADHess$ptr,"i")),
            j = as.integer(attr(ADHess$ptr,"j")),
            x = ev(obj$env$par), Dim = c(n,n), uplo = "L")
-  Hfull <- .T2Cmat(M) ## WAS: as(M,"dsCMatrix")
+  Hfull <- as(M, "CsparseMatrix") ## WAS: as(M,"dsCMatrix")
   Hrandom <- Hfull[r,r,drop=FALSE]
   ## before returning the function, remove unneeded variables from the environment:
   rm(skip, n, M)

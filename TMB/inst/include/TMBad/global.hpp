@@ -25,6 +25,11 @@ typedef TMBAD_SCALAR_TYPE Scalar;
 typedef std::pair<Index, Index> IndexPair;
 typedef TMBAD_INDEX_VECTOR IndexVector;
 
+struct global;
+/** \brief Get pointer to current global AD context (or NULL if no context is
+ * active). */
+global *get_glob();
+
 template <class T>
 std::ostream &operator<<(std::ostream &out, const std::vector<T> &v) {
   out << "{";
@@ -260,7 +265,7 @@ struct Args {
   Index input(Index j) const { return inputs[ptr.first + j]; }
   /** \brief Get variable index of j'th output of current operator */
   Index output(Index j) const { return ptr.second + j; }
-  Args(const IndexVector &inputs) : inputs(&inputs[0]) {
+  Args(const IndexVector &inputs) : inputs(inputs.data()) {
     ptr.first = 0;
     ptr.second = 0;
   }
@@ -275,6 +280,7 @@ struct ForwardArgs : Args<> {
   typedef std::vector<Type> TypeVector;
   typedef Type value_type;
   Type *values;
+  global *glob_ptr;
   /** \brief j'th input variable of this operator */
   Type x(Index j) const { return values[input(j)]; }
   /** \brief j'th output variable of this operator */
@@ -291,8 +297,9 @@ struct ForwardArgs : Args<> {
   segment_ref<ForwardArgs, y_write> y_segment(Index from, Index size) {
     return segment_ref<ForwardArgs, y_write>(*this, from, size);
   }
-  ForwardArgs(const IndexVector &inputs, TypeVector &values)
-      : Args<>(inputs), values(&values[0]) {}
+  ForwardArgs(const IndexVector &inputs, TypeVector &values,
+              global *glob_ptr = NULL)
+      : Args<>(inputs), values(values.data()), glob_ptr(glob_ptr) {}
 };
 /** \brief Access input/output values and derivatives during a reverse
     pass. Write access granted for the input derivative only.
@@ -306,6 +313,7 @@ struct ReverseArgs : Args<> {
   typedef Type value_type;
   Type *values;
   Type *derivs;
+  global *glob_ptr;
   /** \brief j'th input variable of this operator */
   Type x(Index j) const { return values[input(j)]; }
   /** \brief j'th output variable of this operator */
@@ -340,8 +348,12 @@ struct ReverseArgs : Args<> {
   segment_ref<ReverseArgs, dy_read> dy_segment(Index from, Index size) {
     return segment_ref<ReverseArgs, dy_read>(*this, from, size);
   }
-  ReverseArgs(const IndexVector &inputs, TypeVector &values, TypeVector &derivs)
-      : Args<>(inputs), values(&values[0]), derivs(&derivs[0]) {
+  ReverseArgs(const IndexVector &inputs, TypeVector &values, TypeVector &derivs,
+              global *glob_ptr = NULL)
+      : Args<>(inputs),
+        values(values.data()),
+        derivs(derivs.data()),
+        glob_ptr(glob_ptr) {
     ptr.first = (Index)inputs.size();
     ptr.second = (Index)values.size();
   }
@@ -374,8 +386,26 @@ struct ForwardArgs<bool> : Args<> {
   /** \brief Helper */
   template <class Operator>
   void mark_all_output(const Operator &op) {
-    Index noutput = op.output_size();
-    for (Index j = 0; j < noutput; j++) y(j) = true;
+    if (Operator::updating && op.output_size() == 0) {
+      Dependencies dep;
+      op.dependencies_updating(*this, dep);
+
+      for (size_t i = 0; i < dep.size(); i++) values[dep[i]] = true;
+
+      for (size_t i = 0; i < dep.I.size(); i++) {
+        Index a = dep.I[i].first;
+        Index b = dep.I[i].second;
+        bool insert = marked_intervals.insert(a, b);
+        if (insert) {
+          for (Index j = a; j <= b; j++) {
+            values[j] = true;
+          }
+        }
+      }
+    } else {
+      Index noutput = op.output_size();
+      for (Index j = 0; j < noutput; j++) y(j) = true;
+    }
   }
   /** \brief Dense sparsity pattern */
   template <class Operator>
@@ -405,9 +435,15 @@ struct ReverseArgs<bool> : Args<> {
   template <class Operator>
   bool any_marked_output(const Operator &op) {
     if (Operator::elimination_protected) return true;
-    Index noutput = op.output_size();
-    for (Index j = 0; j < noutput; j++)
-      if (y(j)) return true;
+    if (Operator::updating && op.output_size() == 0) {
+      Dependencies dep;
+      op.dependencies_updating(*this, dep);
+      return dep.any(values);
+    } else {
+      Index noutput = op.output_size();
+      for (Index j = 0; j < noutput; j++)
+        if (y(j)) return true;
+    }
     return false;
   }
   /** \brief Helper */
@@ -645,9 +681,6 @@ struct graph {
   graph(size_t num_nodes, const std::vector<IndexPair> &edges);
 };
 
-struct global;
-global *get_glob();
-
 namespace {
 template <class CompleteOperator, bool dynamic>
 struct constructOperator {};
@@ -692,11 +725,80 @@ struct constructOperator<CompleteOperator, true> {
 };
 }  // namespace
 
+/** \brief Bitwise collection of selected operator flags
+    \details These flags are available for any operator in the
+   `operation_stack`.
+*/
+struct op_info {
+  /** \brief Type used for internal integer representation */
+  typedef int IntRep;
+  /** \brief Internal integer representation */
+  IntRep code;
+  /** \brief Enumeration of selected boolean flags in `global::Operator` */
+  enum op_flag {
+    /** \copydoc global::Operator::dynamic */
+    dynamic,
+    /** \copydoc global::Operator::smart_pointer */
+    smart_pointer,
+    /** \copydoc global::Operator::is_linear */
+    is_linear,
+    /** \copydoc global::Operator::is_constant */
+    is_constant,
+    /** \copydoc global::Operator::independent_variable */
+    independent_variable,
+    /** \copydoc global::Operator::dependent_variable */
+    dependent_variable,
+    /** \copydoc global::Operator::allow_remap */
+    allow_remap,
+    /** \copydoc global::Operator::elimination_protected */
+    elimination_protected,
+    /** \copydoc global::Operator::updating */
+    updating,
+    /** \brief Mark end of enum */
+    op_flag_count
+  };
+  template <class T>
+  IntRep get_flags(T op) {
+    return
+
+        (op.dynamic * (1 << dynamic)) |
+        (op.smart_pointer * (1 << smart_pointer)) |
+        (op.is_linear * (1 << is_linear)) |
+        (op.is_constant * (1 << is_constant)) |
+        (op.independent_variable * (1 << independent_variable)) |
+        (op.dependent_variable * (1 << dependent_variable)) |
+        (op.allow_remap * (1 << allow_remap)) |
+        (op.elimination_protected * (1 << elimination_protected)) |
+        (op.updating * (1 << updating));
+  }
+  op_info();
+  op_info(op_flag f);
+
+  template <class T>
+  op_info(T op) : code(get_flags(op)) {}
+  /** \brief Test if a given flag is set */
+  bool test(op_flag f) const;
+  op_info &operator|=(const op_info &other);
+  op_info &operator&=(const op_info &other);
+};
+
+/** \brief Struct defining the main AD context.
+
+    - An AD context holds the three data arrays defining the tape: `opstack`,
+   `inputs` and `values`.
+    - An AD context can be activated (set global) using `ad_start()` or
+   inactivated using `ad_stop()`.
+    - `get_glob()` gives a pointer to the current active AD context.
+    - AD contexts can be started and stopped while others are running (nested AD
+   contexts).
+    - An AD context has a unique parent context. The *context stack* is defined
+   as the recursive parent traversal from `get_glob()` (top) to `NULL` (bottom).
+*/
 struct global {
   struct ad_plain;
   struct ad_aug;
   typedef TMBAD_REPLAY_TYPE Replay;
-  struct ad_range;
+  struct ad_segment;
   struct print_config;
   /** \brief The abstract operator for the operation stack `global::opstack`
       - The methods in this class must be implemented for all operators.
@@ -755,6 +857,10 @@ struct global {
         `reverse(ReverseArgs<Replay>& args)`.
     */
     virtual void dependencies(Args<> &args, Dependencies &dep) = 0;
+    /** \brief Get the indices of variables updated by this operator.
+        \details Used only when `Operator::updating` flag is set.
+    */
+    virtual void dependencies_updating(Args<> &args, Dependencies &dep) = 0;
     /** \brief Replay operation sequence. \copydoc forward */
     virtual void forward(ForwardArgs<Replay> &args) = 0;
     /** \brief Replay operation sequence. \copydoc reverse */
@@ -785,17 +891,6 @@ struct global {
     virtual OperatorPure *copy() = 0;
     /** \brief Deallocate this OperatorPure. */
     virtual void deallocate() = 0;
-    /** \brief Operator info that is constant for this operator */
-    struct op_info {
-      bool dynamic;
-      bool smart_pointer;
-      bool dense;
-      bool is_linear;
-      bool independent_variable;
-      bool dependent_variable;
-      bool allow_remap;
-      bool elimination_protected;
-    };
     /** \brief Get operator info. */
     virtual op_info info() = 0;
     /** \brief Optional operator_data */
@@ -820,19 +915,22 @@ struct global {
       wouldn't do the expected. Use `clear()` instead.
   */
   struct operation_stack : std::vector<OperatorPure *> {
-    bool any_dynamic;
+    typedef std::vector<OperatorPure *> Base;
+    /** \brief Bitwise max of operator flags in this stack */
+    op_info any;
+    /** \brief Default CTOR */
     operation_stack();
-    operation_stack(const operation_stack &x);
-    template <bool dynamic>
-    void push_back(OperatorPure *x) {
-      std::vector<OperatorPure *>::push_back(x);
-      if (dynamic) any_dynamic = true;
-    }
-    void push_back(OperatorPure *x, bool dynamic);
-    operation_stack &operator=(const operation_stack &x);
+    /** \brief Copy CTOR */
+    operation_stack(const operation_stack &other);
+    /** \brief Add new operator to this stack and update bitwise operator
+     * information */
+    void push_back(OperatorPure *x);
+    /** \brief Copy assignment */
+    operation_stack &operator=(const operation_stack &other);
     ~operation_stack();
+    /** \brief Clear the operation stack without freeing the container */
     void clear();
-    void copy_from(const operation_stack &x);
+    void copy_from(const operation_stack &other);
   };
 
   /** \brief Operation stack */
@@ -1036,6 +1134,10 @@ struct global {
  */
   void forward_dense(std::vector<bool> &marks);
 
+  intervals<Index> updating_intervals() const;
+
+  intervals<Index> updating_intervals_sub() const;
+
   struct replay {
     /** \brief Mimic `orig` operation sequence value array `global::values` */
     std::vector<Replay> values;
@@ -1074,6 +1176,8 @@ struct global {
         Restore the previous active operation sequence
     */
     void stop();
+    /** \brief Add 'updatable' derivatives to the tape */
+    void add_updatable_derivs(const intervals<Index> &I);
     /** \brief Initialize derivative array used by this replay */
     void clear_deriv();
     /** \brief Forward replay of `replay::orig` operation sequence.
@@ -1436,10 +1540,41 @@ struct global {
     static const int max_fuse_depth = 2;
     /** \brief Is this a linear operator ? */
     static const bool is_linear = false;
+    /** \brief Is this a constant operator ? */
+    static const bool is_constant = false;
     /** \brief Is this operator a 'smart pointer' (with reference counting) ? */
     static const bool smart_pointer = false;
     /** \brief Protect this operator from elimination by the tape optimizer ? */
     static const bool elimination_protected = false;
+    /** \brief This operator **may** update existing variables ?
+
+        \details An 'updating' operator is allowed to update
+        (increment/decrement) *certain* ('updatable') variables
+        already on the tape.  In general this property breaks basic
+        principles of reverse mode AD unless the following extra
+        requirement is satisfied:
+
+        - Once an updatable variable have been *read* it may no longer be
+       updated.
+
+        This requrement always holds for the derivative variables during reverse
+       replay. We note that 'updating' operators are considered an extension to
+       the standard AD framework. In particular, a more complex dependency
+       anlysis is required:
+
+        - Updating operators **must** have `implicit_dependencies=true`.
+        - The `updating` flag **must** be inherited by derivatives.
+        - The `updating` flag signifies that necessary derivative
+          workspaces are added to the tape prior to any reverse
+          replay.
+        - An `updating` operator **must** implement the member
+          `dependencies_updating()` defining which variables are
+          updated.
+    */
+    static const bool updating = false;
+    /** \brief Default implementation of `OperatorPure::dependencies_updating()`
+     */
+    void dependencies_updating(Args<> &args, Dependencies &dep) const {}
     /** \brief How to fuse this operator (self) with another (other) */
     OperatorPure *other_fuse(OperatorPure *self, OperatorPure *other) {
       return NULL;
@@ -2041,6 +2176,22 @@ struct global {
       pOp->ref_count.increment();
       return get_glob()->add_to_stack<OperatorBase>(pOp, x);
     }
+    ad_segment operator()(const ad_segment &x) {
+      TMBAD_ASSERT2(OperatorBase::dynamic,
+                    "Stack to heap copy only allowed for dynamic operators");
+      Complete *pOp = new Complete(*this);
+      TMBAD_ASSERT2(pOp->ref_count() == 0, "Operator already on the heap");
+      pOp->ref_count.increment();
+      return get_glob()->add_to_stack<OperatorBase>(pOp, x);
+    }
+    ad_segment operator()(const ad_segment &x, const ad_segment &y) {
+      TMBAD_ASSERT2(OperatorBase::dynamic,
+                    "Stack to heap copy only allowed for dynamic operators");
+      Complete *pOp = new Complete(*this);
+      TMBAD_ASSERT2(pOp->ref_count() == 0, "Operator already on the heap");
+      pOp->ref_count.increment();
+      return get_glob()->add_to_stack<OperatorBase>(pOp, x, y);
+    }
     template <class T>
     std::vector<T> operator()(const std::vector<T> &x) {
       std::vector<ad_plain> x_(x.begin(), x.end());
@@ -2057,6 +2208,9 @@ struct global {
     }
     void dependencies(Args<> &args, Dependencies &dep) {
       Op.dependencies(args, dep);
+    }
+    void dependencies_updating(Args<> &args, Dependencies &dep) {
+      Op.dependencies_updating(args, dep);
     }
     void increment(IndexPair &ptr) { Op.increment(ptr); }
     void decrement(IndexPair &ptr) { Op.decrement(ptr); }
@@ -2102,16 +2256,8 @@ struct global {
       }
       delete this;
     }
-    OperatorPure::op_info info() {
-      OperatorPure::op_info info;
-      info.dynamic = Op.dynamic;
-      info.smart_pointer = Op.smart_pointer;
-      info.independent_variable = Op.independent_variable;
-      info.dependent_variable = Op.dependent_variable;
-      info.allow_remap = Op.allow_remap;
-      info.is_linear = Op.is_linear;
-      info.elimination_protected = Op.elimination_protected;
-
+    op_info info() {
+      op_info info(Op);
       return info;
     }
     void *identifier() {
@@ -2177,6 +2323,7 @@ struct global {
 
   struct ConstOp : Operator<0, 1> {
     static const bool is_linear = true;
+    static const bool is_constant = true;
     template <class Type>
     void forward(ForwardArgs<Type> &args) {}
     void forward(ForwardArgs<Replay> &args);
@@ -2184,6 +2331,41 @@ struct global {
     void reverse(ReverseArgs<Type> &args) {}
     const char *op_name();
     void forward(ForwardArgs<Writer> &args);
+  };
+  struct DataOp : DynamicOutputOperator<0> {
+    typedef DynamicOutputOperator<0> Base;
+    static const bool is_linear = true;
+    DataOp(Index n);
+    template <class Type>
+    void forward(ForwardArgs<Type> &args) {}
+    template <class Type>
+    void reverse(ReverseArgs<Type> &args) {}
+    const char *op_name();
+    void forward(ForwardArgs<Writer> &args);
+  };
+  /** \brief Add zero allocated workspace to the tape
+
+      Serves as a pre-allocated workspace for `Operator::updating`
+      operators. In particular
+
+      - Operator outputs are not allowed to be remapped (ensured by 'dynamic')
+      - Operator persists during forward replay
+  */
+  struct ZeroOp : DynamicOutputOperator<0> {
+    typedef DynamicOutputOperator<0> Base;
+    static const bool add_forward_replay_copy = true;
+    ZeroOp(Index n);
+    template <class Type>
+    void forward(ForwardArgs<Type> &args) {
+      for (Index i = 0; i < Base::noutput; i++) args.y(i) = Type(0);
+    }
+    template <class Type>
+    void reverse(ReverseArgs<Type> &args) {}
+    const char *op_name();
+    void forward(ForwardArgs<Writer> &args);
+    /** \brief Override a consequtive set of variables by a zero allocated
+     * workspace */
+    void operator()(Replay *x, Index n);
   };
   /** \brief Empty operator **without** inputs or outputs */
   struct NullOp : Operator<0, 0> {
@@ -2260,22 +2442,7 @@ struct global {
 
   /** \brief Add `OperatorPure` to stack and trigger operator fusion
       if enabled */
-  template <bool dynamic>
-  void add_to_opstack(OperatorPure *pOp) {
-    if (fuse) {
-      while (this->opstack.size() > 0) {
-        OperatorPure *OpTry = this->Fuse(this->opstack.back(), pOp);
-        if (OpTry == NULL) break;
-
-        this->opstack.pop_back();
-        pOp = OpTry;
-
-        this->opstack.any_dynamic = true;
-      }
-    }
-
-    this->opstack.push_back<dynamic>(pOp);
-  }
+  void add_to_opstack(OperatorPure *pOp);
   /** \brief Add nullary operator to the stack based on its **result**  */
   template <class OperatorBase>
   ad_plain add_to_stack(Scalar result = 0) {
@@ -2285,7 +2452,7 @@ struct global {
     this->values.push_back(result);
 
     Complete<OperatorBase> *pOp = this->template getOperator<OperatorBase>();
-    add_to_opstack<OperatorBase::dynamic>(pOp);
+    add_to_opstack(pOp);
 
     TMBAD_ASSERT(!TMBAD_INDEX_OVERFLOW(values.size()));
     return ans;
@@ -2301,7 +2468,7 @@ struct global {
     this->inputs.push_back(x.index);
 
     Complete<OperatorBase> *pOp = this->template getOperator<OperatorBase>();
-    add_to_opstack<OperatorBase::dynamic>(pOp);
+    add_to_opstack(pOp);
 
     TMBAD_ASSERT(!TMBAD_INDEX_OVERFLOW(values.size()));
     TMBAD_ASSERT(!TMBAD_INDEX_OVERFLOW(inputs.size()));
@@ -2319,24 +2486,55 @@ struct global {
     this->inputs.push_back(y.index);
 
     Complete<OperatorBase> *pOp = this->template getOperator<OperatorBase>();
-    add_to_opstack<OperatorBase::dynamic>(pOp);
+    add_to_opstack(pOp);
 
     TMBAD_ASSERT(!TMBAD_INDEX_OVERFLOW(values.size()));
     TMBAD_ASSERT(!TMBAD_INDEX_OVERFLOW(inputs.size()));
     return ans;
   }
   template <class OperatorBase>
-  ad_range add_to_stack(ad_range lhs, ad_range rhs) {
+  ad_segment add_to_stack(ad_segment lhs, ad_segment rhs,
+                          ad_segment more = ad_segment()) {
     IndexPair ptr((Index)inputs.size(), (Index)values.size());
     Complete<OperatorBase> *pOp =
         this->template getOperator<OperatorBase>(lhs, rhs);
     size_t n = pOp->output_size();
-    ad_range ans(values.size(), n);
-    inputs.push_back(ad_plain(lhs).index);
-    inputs.push_back(ad_plain(rhs).index);
-    opstack.push_back<OperatorBase::dynamic>(pOp);
+    ad_segment ans(values.size(), n);
+    inputs.push_back(lhs.index());
+    inputs.push_back(rhs.index());
+    if (more.size() > 0) inputs.push_back(more.index());
+    opstack.push_back(pOp);
     values.resize(values.size() + n);
-    ForwardArgs<Scalar> args(inputs, values);
+    ForwardArgs<Scalar> args(inputs, values, this);
+    args.ptr = ptr;
+    pOp->forward(args);
+
+    TMBAD_ASSERT(!TMBAD_INDEX_OVERFLOW(values.size()));
+    TMBAD_ASSERT(!TMBAD_INDEX_OVERFLOW(inputs.size()));
+    return ans;
+  }
+
+  template <class OperatorBase>
+  ad_segment add_to_stack(Complete<OperatorBase> *pOp, ad_segment lhs,
+                          ad_segment rhs = ad_segment()) {
+    static_assert(
+        OperatorBase::dynamic,
+        "Unlikely that you want to use this method for static operators?");
+    static_assert(
+        OperatorBase::ninput == 0 || OperatorBase::implicit_dependencies,
+        "Operators with pointer inputs should always implement "
+        "'implicit_dependencies'");
+
+    IndexPair ptr((Index)inputs.size(), (Index)values.size());
+    size_t n = pOp->output_size();
+    ad_segment ans(values.size(), n);
+    TMBAD_ASSERT((Index)(lhs.size() > 0) + (Index)(rhs.size() > 0) ==
+                 pOp->input_size());
+    if (lhs.size() > 0) inputs.push_back(lhs.index());
+    if (rhs.size() > 0) inputs.push_back(rhs.index());
+    opstack.push_back(pOp);
+    values.resize(values.size() + n);
+    ForwardArgs<Scalar> args(inputs, values, this);
     args.ptr = ptr;
     pOp->forward(args);
 
@@ -2352,18 +2550,18 @@ struct global {
     IndexPair ptr((Index)inputs.size(), (Index)values.size());
     size_t m = pOp->input_size();
     size_t n = pOp->output_size();
-    ad_range ans(values.size(), n);
+    ad_segment ans(values.size(), n);
     for (size_t i = 0; i < m; i++) inputs.push_back(x[i].index);
-    opstack.push_back<OperatorBase::dynamic>(pOp);
+    opstack.push_back(pOp);
     values.resize(values.size() + n);
-    ForwardArgs<Scalar> args(inputs, values);
+    ForwardArgs<Scalar> args(inputs, values, this);
     args.ptr = ptr;
     pOp->forward(args);
 
     TMBAD_ASSERT(!TMBAD_INDEX_OVERFLOW(values.size()));
     TMBAD_ASSERT(!TMBAD_INDEX_OVERFLOW(inputs.size()));
     std::vector<ad_plain> out(n);
-    for (size_t i = 0; i < n; i++) out[i].index = ans.index + i;
+    for (size_t i = 0; i < n; i++) out[i].index = ans.index() + i;
     return out;
   }
 
@@ -2371,7 +2569,7 @@ struct global {
     Index index;
     static const Index NA = (Index)-1;
     bool initialized() const;
-    bool ontape() const;
+    bool on_some_tape() const;
     /** \brief Compatibiltiy with ad_aug */
     void addToTape() const;
     /** \brief Get the tape of this ad_plain */
@@ -2572,25 +2770,64 @@ struct global {
   /** \brief Stop ad calculations from being piped to this glob. */
   void ad_stop();
   void Independent(std::vector<ad_plain> &x);
-  /** \brief Range of `ad_plain` with optional extra information */
-  struct ad_range : ad_plain {
+  /** \brief Contiguous set of variables on the *current* tape
+
+      This class can represent vectors (or matrices) in a compact way
+      assuming that numerical values are available on the tape as a
+      contiguous *segment*. The class stores the offset and the size
+      (or dimension) of the segment.
+  */
+  struct ad_segment {
+    ad_plain x;
     size_t n;
     size_t c;
-    ad_range(ad_plain x, size_t n);
-    ad_range(Index idx, size_t n);
-    ad_range(ad_plain x, size_t r, size_t c);
+    /** \brief Construct empty object */
+    ad_segment();
+    /** \brief Construct vector like object */
+    ad_segment(ad_plain x, size_t n);
+    /** \brief Construct length one object (variable) */
+    ad_segment(ad_aug x);
+    /** \brief Construct length one object (constant) */
+    ad_segment(Scalar x);
+    /** \brief Construction from offset (index) and size */
+    ad_segment(Index idx, size_t n);
+    /** \brief Construct matrix like object */
+    ad_segment(ad_plain x, size_t r, size_t c);
+    /** \brief Construction based on values that might *not* be on the
+        tape or might *not* satisfy the storage requirement. */
+    ad_segment(Replay *x, size_t n, bool zero_check = false);
+    bool identicalZero();
+    bool all_on_active_tape(Replay *x, size_t n);
+    bool is_contiguous(Replay *x, size_t n);
+    bool all_zero(Replay *x, size_t n);
+    bool all_constant(Replay *x, size_t n);
     size_t size() const;
     size_t rows() const;
     size_t cols() const;
+
+    ad_plain operator[](size_t i) const;
+    ad_plain offset() const;
+    Index index() const;
   };
-  /** \brief Augmented AD type \details `ad_aug` is an augmentation of
-      the simple type `ad_plain`. It tries hard to keep tapes small by
-      only adding operations when strictly necessary. For instance, it
-      detects whether a variable is constant or identical zero to see
-      if a reduction is possible to avoid adding the variable to the
-      tape. The downside is that `ad_aug` takes up slightly more
-      memory.
- */
+  /** \brief Augmented AD type
+
+      \details `ad_aug` is an 'augmented' AD type which, in contrast
+      to `ad_plain`, knows on which tape it belongs. This facilitates
+      some extra features:
+
+      Nested AD: An `ad_aug` may refer to other variables on
+      different tapes as long as they can be found in the 'active
+      context stack' (defined here: `TMBad::global`).
+
+      In addition, `ad_aug` can keep tapes small by only adding
+      operations when strictly necessary. For instance, it detects
+      whether a variable is constant or identical zero to see if a
+      reduction is possible to avoid adding the variable to the
+      tape.
+
+      The downside of `ad_aug` is that is takes up slightly more
+      memory than `ad_plain`.
+  */
   struct ad_aug {
     /** \brief If `taped_value` **is** initialized (see
         `ad_plain::initialize`) this is the value of `ad_aug`. */
@@ -2603,8 +2840,17 @@ struct global {
       mutable global *glob;
     }
     data;
+    /** \brief Is this object on *some* (not necessarily active) tape? */
+    bool on_some_tape() const;
+    /** \brief Is this object on the current active tape? */
+    bool on_active_tape() const;
+    /** \brief Alias for `on_some_tape()` (for backward compatibility only) */
     bool ontape() const;
+    /** \brief Is this object guarantied to be a constant?
+        \note If `false` the object *may* or *may not* be constant.
+    */
     bool constant() const;
+    Index index() const;
     /** \brief Get the tape of this ad_aug
         \return Returns the tape address of this variable **if**
         variable belongs to *some* tape.  Otherwise `NULL` is
@@ -2790,17 +3036,17 @@ Scalar Value(T x) {
 Scalar Value(Scalar x);
 
 /** \brief Is this ad vector available as a contiguous block on the tape?
-    \details Template type 'T' can be
+    \details Template type 'V::value_type' can be
     - ad_plain
     - ad_aug
     - ad_adapt
 */
-template <class T>
-bool isContiguous(std::vector<T> &x) {
+template <class V>
+bool isContiguous(V &x) {
   bool ok = true;
   Index j_previous;
   for (size_t i = 0; i < (size_t)x.size(); i++) {
-    if (!x[i].ontape()) {
+    if (!x[i].on_some_tape()) {
       ok = false;
       break;
     }
@@ -2816,25 +3062,25 @@ bool isContiguous(std::vector<T> &x) {
   return ok;
 }
 /** \brief Get contiguous (deep) copy of this vector
-    \details Template type 'T' can be
+    \details Template type 'V::value_type' can be
     - ad_plain
     - ad_aug
     - ad_adapt
 */
-template <class T>
-std::vector<T> getContiguous(const std::vector<T> &x) {
-  std::vector<T> y(x.size());
+template <class V>
+V getContiguous(const V &x) {
+  V y(x.size());
   for (size_t i = 0; i < (size_t)x.size(); i++) y[i] = x[i].copy();
   return y;
 }
 /** \brief Make contiguous ad vector
-    \details Template type 'T' can be
+    \details Template type 'V::value_type' can be
     - ad_plain
     - ad_aug
     - ad_adapt
 */
-template <class T>
-void forceContiguous(std::vector<T> &x) {
+template <class V>
+void forceContiguous(V &x) {
   if (!isContiguous(x)) x = getContiguous(x);
 }
 ad_aug operator+(const double &x, const ad_aug &y);
@@ -2952,8 +3198,11 @@ using ::expm1;
 using ::fabs;
 using ::log1p;
 using std::acos;
+using std::acosh;
 using std::asin;
+using std::asinh;
 using std::atan;
+using std::atanh;
 using std::cos;
 using std::cosh;
 using std::exp;
@@ -3225,6 +3474,60 @@ struct AtanOp : global::UnaryOperator {
 ad_plain atan(const ad_plain &x);
 ad_aug atan(const ad_aug &x);
 ad_adapt atan(const ad_adapt &x);
+Writer asinh(const Writer &x);
+struct AsinhOp : global::UnaryOperator {
+  static const bool have_eval = true;
+  template <class Type>
+  Type eval(Type x) {
+    return asinh(x);
+  }
+  template <class Type>
+  void reverse(ReverseArgs<Type> &args) {
+    args.dx(0) +=
+        args.dy(0) * Type(1.) / sqrt(args.x(0) * args.x(0) + Type(1.));
+  }
+  void reverse(ReverseArgs<Scalar> &args);
+  const char *op_name();
+};
+ad_plain asinh(const ad_plain &x);
+ad_aug asinh(const ad_aug &x);
+ad_adapt asinh(const ad_adapt &x);
+Writer acosh(const Writer &x);
+struct AcoshOp : global::UnaryOperator {
+  static const bool have_eval = true;
+  template <class Type>
+  Type eval(Type x) {
+    return acosh(x);
+  }
+  template <class Type>
+  void reverse(ReverseArgs<Type> &args) {
+    args.dx(0) +=
+        args.dy(0) * Type(1.) / sqrt(args.x(0) * args.x(0) - Type(1.));
+  }
+  void reverse(ReverseArgs<Scalar> &args);
+  const char *op_name();
+};
+ad_plain acosh(const ad_plain &x);
+ad_aug acosh(const ad_aug &x);
+ad_adapt acosh(const ad_adapt &x);
+Writer atanh(const Writer &x);
+struct AtanhOp : global::UnaryOperator {
+  static const bool have_eval = true;
+  template <class Type>
+  Type eval(Type x) {
+    return atanh(x);
+  }
+  template <class Type>
+  void reverse(ReverseArgs<Type> &args) {
+    args.dx(0) += args.dy(0) * Type(1.) / (Type(1) - args.x(0) * args.x(0));
+  }
+  void reverse(ReverseArgs<Scalar> &args);
+  const char *op_name();
+};
+ad_plain atanh(const ad_plain &x);
+ad_aug atanh(const ad_aug &x);
+ad_adapt atanh(const ad_adapt &x);
+
 template <class T>
 T abs(const T &x) {
   return fabs(x);
@@ -3247,6 +3550,26 @@ struct PowOp : global::BinaryOperator {
 ad_plain pow(const ad_plain &x1, const ad_plain &x2);
 ad_aug pow(const ad_aug &x1, const ad_aug &x2);
 ad_adapt pow(const ad_adapt &x1, const ad_adapt &x2);
+using std::atan2;
+Writer atan2(const Writer &x1, const Writer &x2);
+struct Atan2 : global::BinaryOperator {
+  static const bool have_eval = true;
+  template <class Type>
+  Type eval(Type x1, Type x2) {
+    return atan2(x1, x2);
+  }
+  template <class Type>
+  void reverse(ReverseArgs<Type> &args) {
+    args.dx(0) += args.dy(0) * args.x(1) /
+                  (args.x(0) * args.x(0) + args.x(1) * args.x(1));
+    args.dx(1) += args.dy(0) * -args.x(0) /
+                  (args.x(0) * args.x(0) + args.x(1) * args.x(1));
+  }
+  const char *op_name();
+};
+ad_plain atan2(const ad_plain &x1, const ad_plain &x2);
+ad_aug atan2(const ad_aug &x1, const ad_aug &x2);
+ad_adapt atan2(const ad_adapt &x1, const ad_adapt &x2);
 using std::max;
 Writer max(const Writer &x1, const Writer &x2);
 struct MaxOp : global::BinaryOperator {

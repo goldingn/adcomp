@@ -14,7 +14,7 @@ all:
 	make pdf
 
 doc-update:
-	echo "library(roxygen2);roxygenize(\"$(PACKAGE)\",roclets = c(\"collate\", \"rd\"))" | $(R) --slave
+	echo "library(roxygen2);roxygenize(\"$(PACKAGE)\",roclets = c(\"collate\", \"rd\"), load_code=load_source)" | $(R) --slave
 
 build-package:
 	$(R) CMD build --resave-data=no $(PACKAGE)
@@ -115,7 +115,6 @@ cran-version:
 	echo "  if(!file.exists(dll)) runExample(\"simple\", dontrun=TRUE, eigen.disable.warnings=FALSE)" >> TMB/R/zzz.R
 	echo "}"                                                                                          >> TMB/R/zzz.R
 	make eliminate-cout
-	make doc-update
 	make build-package
 
 ##########################################################

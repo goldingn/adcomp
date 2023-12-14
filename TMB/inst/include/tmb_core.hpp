@@ -17,10 +17,32 @@
     is responsible for catching its own exceptions.
 */
 
+#ifndef TMB_TRY
 #define TMB_TRY try
-#define TMB_CATCH catch(std::bad_alloc& ba)
-#define TMB_ERROR_BAD_ALLOC Rf_error("Memory allocation fail in function '%s'\n", \
-				  __FUNCTION__)
+#endif
+// By default we only accept 'bad_alloc' as a valid exception. Everything else => debugger !
+// Behaviour can be changed by re-defining this macro.
+#ifndef TMB_CATCH
+#define TMB_CATCH catch(std::bad_alloc& excpt)
+#endif
+// Inside the TMB_CATCH comes 'cleanup code' followed by this error
+// call (allowed to depend on the exception 'excpt')
+// Error message can be changed by re-defining this macro.
+#ifndef TMB_ERROR_BAD_ALLOC
+#define TMB_ERROR_BAD_ALLOC                             \
+Rf_error("Caught exception '%s' in function '%s'\n",    \
+         excpt.what(),                                  \
+         __FUNCTION__)
+#endif
+// Error call comes outside TMB_CATCH in OpenMP case (so *cannot*
+// depend on exception e.g. 'excpt')
+// Error message can be changed by re-defining this macro.
+#ifndef TMB_ERROR_BAD_THREAD_ALLOC
+#define TMB_ERROR_BAD_THREAD_ALLOC                      \
+Rf_error("Caught exception '%s' in function '%s'\n",    \
+         bad_thread_alloc,                              \
+         __FUNCTION__)
+#endif
 
 /* Memory manager:
    Count the number of external pointers alive.
@@ -748,7 +770,7 @@ public:
   /** \brief Syncronize user's data object. It could be changed between calls to e.g. EvalDoubleFunObject */
   void sync_data() {
     SEXP env = ENCLOS(this->report);
-    this->data = findVar(install("data"), env);
+    this->data = Rf_findVar(Rf_install("data"), env);
   }
 
   /** \brief Extract theta vector from objetive function object */
@@ -1358,7 +1380,7 @@ extern "C"
       if (n==0) n++; // No explicit parallel accumulation
       start_parallel(); /* FIXME: NOT NEEDED */
       vector< adfun* > pfvec(n);
-      bool bad_thread_alloc = false;
+      const char* bad_thread_alloc = NULL;
 #pragma omp parallel for num_threads(config.nthreads) if (config.tape.parallel && n>1)
       for(int i = 0; i < n; i++) {
         TMB_TRY {
@@ -1366,11 +1388,13 @@ extern "C"
           pfvec[i] = MakeADFunObject_(data, parameters, report, control, i, info);
           if (config.optimize.instantly) pfvec[i]->optimize();
         }
-        TMB_CATCH { bad_thread_alloc = true; }
+        TMB_CATCH {
+          if (pfvec[i] != NULL) delete pfvec[i];
+          bad_thread_alloc = excpt.what();
+        }
       }
       if (bad_thread_alloc) {
-        for(int i=0; i<n; i++) if (pfvec[i] != NULL) delete pfvec[i];
-        TMB_ERROR_BAD_ALLOC;
+        TMB_ERROR_BAD_THREAD_ALLOC;
       }
 
       // FIXME: NOT DONE YET
@@ -1441,7 +1465,7 @@ extern "C"
       if (n==0) n++; // No explicit parallel accumulation
       start_parallel(); /* Start threads */
       vector< ADFun<double>* > pfvec(n);
-      bool bad_thread_alloc = false;
+      const char* bad_thread_alloc = NULL;
 #pragma omp parallel for num_threads(config.nthreads) if (config.tape.parallel && n>1)
       for(int i=0;i<n;i++){
 	TMB_TRY {
@@ -1449,11 +1473,13 @@ extern "C"
 	  pfvec[i] = MakeADFunObject_(data, parameters, report, control, i, info);
 	  if (config.optimize.instantly) pfvec[i]->optimize();
 	}
-	TMB_CATCH { bad_thread_alloc = true; }
+	TMB_CATCH {
+          if (pfvec[i] != NULL) delete pfvec[i];
+          bad_thread_alloc = excpt.what();
+        }
       }
-      if(bad_thread_alloc){
-	for(int i=0; i<n; i++) if (pfvec[i] != NULL) delete pfvec[i];
-	TMB_ERROR_BAD_ALLOC;
+      if (bad_thread_alloc) {
+	TMB_ERROR_BAD_THREAD_ALLOC;
       }
       parallelADFun<double>* ppf=new parallelADFun<double>(pfvec);
       /* Convert parallel ADFun pointer to R_ExternalPtr */
@@ -1489,7 +1515,7 @@ extern "C"
 
 #ifdef TMBAD_FRAMEWORK
 inline int get_num_tapes(SEXP f) {
-  if (isNull(f))
+  if (Rf_isNull(f))
     return 0;
   SEXP tag = R_ExternalPtrTag(f);
   if (tag != Rf_install("parallelADFun"))
@@ -1525,7 +1551,7 @@ SEXP TransformADFunObjectTemplate(TMBad::ADFun<TMBad::ad_aug>* pf, SEXP control)
     return R_NilValue;
   }
   SEXP random_order = getListElement(control, "random_order");
-  int nr = (isNull(random_order) ? 0 : LENGTH(random_order));
+  int nr = (Rf_isNull(random_order) ? 0 : LENGTH(random_order));
   std::vector<TMBad::Index> random;
   if (nr != 0) {
     random = std::vector<TMBad::Index>(INTEGER(random_order),
@@ -1851,6 +1877,20 @@ SEXP TransformADFunObject(SEXP f, SEXP control)
   }
 #endif
 
+SEXP getSetGlobalPtr(SEXP ptr) {
+#ifdef TMBAD_FRAMEWORK
+  SEXP global_ptr_tag = Rf_install("global_ptr");
+  if (!Rf_isNull(ptr)) {
+    SEXP tag = R_ExternalPtrTag(ptr);
+    if (tag != global_ptr_tag) Rf_error("Invalid pointer type");
+    TMBad::global_ptr = (TMBad::global**) R_ExternalPtrAddr(ptr);
+  }
+  SEXP res = R_MakeExternalPtr( (void*) TMBad::global_ptr, global_ptr_tag, R_NilValue);
+  return res;
+#else
+  return R_NilValue;
+#endif
+}
 
   SEXP tmbad_print(SEXP f, SEXP control) {
 #ifdef TMBAD_FRAMEWORK
@@ -1867,7 +1907,7 @@ SEXP TransformADFunObject(SEXP f, SEXP control)
     std::string method =
       CHAR(STRING_ELT(getListElement(control, "method"), 0));
     if (method == "num_tapes") { // Get number of tapes
-      return ScalarInteger(num_tapes);
+      return Rf_ScalarInteger(num_tapes);
     }
     else if (method == "tape") { // Print tape
       int depth = getListInteger(control, "depth", 1);
@@ -1906,7 +1946,7 @@ SEXP TransformADFunObject(SEXP f, SEXP control)
       int input_size = getListInteger(control, "input_size", 0);
       int output_size = getListInteger(control, "output_size", 0);
       size_t n = pf->glob.opstack.size();
-      SEXP ans = PROTECT(allocVector(STRSXP, n));
+      SEXP ans = PROTECT(Rf_allocVector(STRSXP, n));
       for (size_t i=0; i<n; i++) {
         std::stringstream strm;
         if (address)     strm << (void*) pf->glob.opstack[i] << " ";
@@ -1914,13 +1954,13 @@ SEXP TransformADFunObject(SEXP f, SEXP control)
         if (input_size)  strm << pf->glob.opstack[i]->input_size();
         if (output_size) strm << pf->glob.opstack[i]->output_size();
         const std::string& tmp = strm.str();
-        SET_STRING_ELT(ans, i, mkChar(tmp.c_str()));
+        SET_STRING_ELT(ans, i, Rf_mkChar(tmp.c_str()));
       }
       UNPROTECT(1);
       return ans;
     }
     else {
-      Rf_error("Unknown method: ", method.c_str());
+      Rf_error("Unknown method: %s", method.c_str());
     }
 #endif
     return R_NilValue;
@@ -1996,7 +2036,7 @@ extern "C"
       if(get_reportdims) {
         SEXP reportdims;
         PROTECT( reportdims = pf -> reportvector.reportdims() );
-        setAttrib( res, install("reportdims"), reportdims);
+        Rf_setAttrib( res, Rf_install("reportdims"), reportdims);
         UNPROTECT(1);
       }
       UNPROTECT(2);
@@ -2117,7 +2157,7 @@ extern "C"
       if (n==0) n++; // No explicit parallel accumulation
       start_parallel(); /* Start threads */
       vector< adfun* > pfvec(n);
-      bool bad_thread_alloc = false;
+      const char* bad_thread_alloc = NULL;
 #pragma omp parallel for num_threads(config.nthreads) if (config.tape.parallel && n>1)
       for(int i=0;i<n;i++){
 	TMB_TRY {
@@ -2125,11 +2165,13 @@ extern "C"
 	  pfvec[i] = MakeADGradObject_(data, parameters, report, control, i);
 	  if (config.optimize.instantly) pfvec[i]->optimize();
 	}
-	TMB_CATCH { bad_thread_alloc = true; }
+	TMB_CATCH {
+          if (pfvec[i] != NULL) delete pfvec[i];
+          bad_thread_alloc = excpt.what();
+        }
       }
-      if(bad_thread_alloc){
-	for(int i=0; i<n; i++) if (pfvec[i] != NULL) delete pfvec[i];
-	TMB_ERROR_BAD_ALLOC;
+      if (bad_thread_alloc) {
+	TMB_ERROR_BAD_THREAD_ALLOC;
       }
       parallelADFun<double>* ppf=new parallelADFun<double>(pfvec);
       /* Convert parallel ADFun pointer to R_ExternalPtr */
@@ -2187,7 +2229,7 @@ extern "C"
       if (n==0) n++; // No explicit parallel accumulation
       start_parallel(); /* Start threads */
       vector< ADFun<double>* > pfvec(n);
-      bool bad_thread_alloc = false;
+      const char* bad_thread_alloc = NULL;
 #pragma omp parallel for num_threads(config.nthreads) if (config.tape.parallel && n>1)
       for(int i=0;i<n;i++){
 	TMB_TRY {
@@ -2195,11 +2237,13 @@ extern "C"
 	  pfvec[i] = MakeADGradObject_(data, parameters, report, control, i);
 	  if (config.optimize.instantly) pfvec[i]->optimize();
 	}
-	TMB_CATCH { bad_thread_alloc = true; }
+	TMB_CATCH {
+          if (pfvec[i] != NULL) delete pfvec[i];
+          bad_thread_alloc = excpt.what();
+        }
       }
-      if(bad_thread_alloc){
-	for(int i=0; i<n; i++) if (pfvec[i] != NULL) delete pfvec[i];
-	TMB_ERROR_BAD_ALLOC;
+      if (bad_thread_alloc) {
+	TMB_ERROR_BAD_THREAD_ALLOC;
       }
       parallelADFun<double>* ppf=new parallelADFun<double>(pfvec);
       /* Convert parallel ADFun pointer to R_ExternalPtr */
@@ -2420,7 +2464,7 @@ extern "C"
     if (n==0) n++; // No explicit parallel accumulation
     start_parallel(); /* FIXME: not needed */
     /* parallel test */
-    bool bad_thread_alloc = false;
+    const char* bad_thread_alloc = NULL;
     vector<sphess*> Hvec(n);
 #pragma omp parallel for num_threads(config.nthreads) if (config.tape.parallel && n>1)
     for (int i=0; i<n; i++) {
@@ -2429,16 +2473,16 @@ extern "C"
 	Hvec[i] = new sphess( MakeADHessObject2_(data, parameters, report, control, i) );
 	//optimizeTape( Hvec[i]->pf );
       }
-      TMB_CATCH { bad_thread_alloc = true; }
+      TMB_CATCH {
+        if (Hvec[i] != NULL) {
+          delete Hvec[i]->pf;
+          delete Hvec[i];
+        }
+        bad_thread_alloc = excpt.what();
+      }
     }
     if (bad_thread_alloc) {
-      for(int i=0; i<n; i++) {
-	if (Hvec[i] != NULL) {
-	  delete Hvec[i]->pf;
-	  delete Hvec[i];
-	}
-      }
-      TMB_ERROR_BAD_ALLOC;
+      TMB_ERROR_BAD_THREAD_ALLOC;
     }
     parallelADFun<double>* tmp=new parallelADFun<double>(Hvec);
     return asSEXP(tmp->convert(),"parallelADFun");
@@ -2482,7 +2526,7 @@ extern "C"
     start_parallel(); /* Start threads */
 
     /* parallel test */
-    bool bad_thread_alloc = false;
+    const char* bad_thread_alloc = NULL;
     vector<sphess*> Hvec(n);
 #pragma omp parallel for num_threads(config.nthreads) if (config.tape.parallel && n>1)
     for (int i=0; i<n; i++) {
@@ -2491,16 +2535,16 @@ extern "C"
 	Hvec[i] = new sphess( MakeADHessObject2_(data, parameters, report, control, i) );
 	optimizeTape( Hvec[i]->pf );
       }
-      TMB_CATCH { bad_thread_alloc = true; }
-    }
-    if (bad_thread_alloc) {
-      for(int i=0; i<n; i++) {
+      TMB_CATCH {
 	if (Hvec[i] != NULL) {
 	  delete Hvec[i]->pf;
 	  delete Hvec[i];
 	}
+        bad_thread_alloc = excpt.what();
       }
-      TMB_ERROR_BAD_ALLOC;
+    }
+    if (bad_thread_alloc) {
+      TMB_ERROR_BAD_THREAD_ALLOC;
     }
     parallelADFun<double>* tmp=new parallelADFun<double>(Hvec);
     for(int i=0; i<n; i++) {
@@ -2560,11 +2604,11 @@ extern "C"
     // ans
     SEXP ans;
 #ifdef TMBAD_FRAMEWORK
-    ans = mkString("TMBad");
+    ans = Rf_mkString("TMBad");
 #elif defined(CPPAD_FRAMEWORK)
-    ans = mkString("CppAD");
+    ans = Rf_mkString("CppAD");
 #else
-    ans = mkString("Unknown");
+    ans = Rf_mkString("Unknown");
 #endif
     PROTECT(ans);
     // openmp_sym (Not strictly necessary to PROTECT)
@@ -2573,14 +2617,24 @@ extern "C"
     // openmp_res
     SEXP openmp_res;
 #ifdef _OPENMP
-    openmp_res = ScalarLogical(1);
+    openmp_res = Rf_ScalarLogical(1);
 #else
-    openmp_res = ScalarLogical(0);
+    openmp_res = Rf_ScalarLogical(0);
 #endif
     PROTECT(openmp_res);
     // Assemble
     Rf_setAttrib(ans, openmp_sym, openmp_res);
-    UNPROTECT(3);
+    UNPROTECT(2);
+    // Add more stuff
+#ifdef TMBAD_FRAMEWORK
+    SEXP index_size_sym = Rf_install("sizeof(Index)");
+    PROTECT(index_size_sym);
+    SEXP index_size = Rf_ScalarInteger(sizeof(TMBad::Index));
+    PROTECT(index_size);
+    Rf_setAttrib(ans, index_size_sym, index_size);
+    UNPROTECT(2);
+#endif
+    UNPROTECT(1); // ans
     return ans;
   }
 }
@@ -2683,6 +2737,7 @@ extern "C"
   SEXP MakeADHessObject2(SEXP data, SEXP parameters, SEXP report, SEXP control);
   SEXP usingAtomics();
   SEXP getFramework();
+  SEXP getSetGlobalPtr(SEXP ptr);
   SEXP TransformADFunObject(SEXP f, SEXP control);
   void tmb_forward(SEXP f, const Eigen::VectorXd &x, Eigen::VectorXd &y);
   void tmb_reverse(SEXP f, const Eigen::VectorXd &v, Eigen::VectorXd &y);
@@ -2712,6 +2767,7 @@ extern "C"{
   {"MakeADHessObject2",   (DL_FUNC) &MakeADHessObject2,   4},   \
   {"usingAtomics",        (DL_FUNC) &usingAtomics,        0},   \
   {"getFramework",        (DL_FUNC) &getFramework,        0},   \
+  {"getSetGlobalPtr",     (DL_FUNC) &getSetGlobalPtr,     1},   \
   {"TMBconfig",           (DL_FUNC) &TMBconfig,           2}
   /* May be used as part of custom R_init function
      C-callable routines (PACKAGE is 'const char*') */

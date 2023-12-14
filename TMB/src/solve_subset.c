@@ -51,6 +51,7 @@
 # define FCONE
 #endif
 #include "Matrix.h"
+#include <Rdefines.h>
 
 /* Copy-pasted from "Writing R Extensions". A similar spell is present
    in Matrix.h so might not be needed anymore ? */
@@ -132,8 +133,8 @@ SEXP tmb_destructive_CHM_update(SEXP L, SEXP H, SEXP mult)
     */
     if (!M_cholmod_factorize_p(A, mm, (int*)NULL, 0 /*fsize*/, f, &c))
       /* -> ./CHOLMOD/Cholesky/cholmod_factorize.c */
-      error("cholmod_factorize_p failed: status %d, minor %d of ncol %d",
-            c.status, f->minor, f->n);
+      error("cholmod_factorize_p failed: status %d, minor %lu of ncol %lu",
+            (int) c.status, (unsigned long) f->minor, (unsigned long) f->n);
     int ok = (f->minor == f->n); // WAS: (c.status == CHOLMOD_OK);
     return ScalarLogical(ok);
 }
@@ -293,7 +294,7 @@ CHM_SP tmb_inv_super(CHM_FR Lfac, cholmod_common *c){
 SEXP tmb_invQ(SEXP Lfac){
   CHM_FR L=AS_CHM_FR(Lfac);
   CHM_SP iQ = tmb_inv_super(L, &c);
-  return M_chm_sparse_to_SEXP(iQ, 1 /* Free */ , 0, 0, "", R_NilValue);
+  return M_chm_sparse_to_SEXP(iQ, 1 /* Free */ , 0, 0, "N" /* Not unit */, R_NilValue);
 }
 
 void half_diag(CHM_SP A){
@@ -314,7 +315,7 @@ SEXP tmb_invQ_tril_halfdiag(SEXP Lfac){
   CHM_SP iQ = tmb_inv_super(L, &c);
   half_diag(iQ);
   iQ->stype=0; /* Change to non-sym */
-  return M_chm_sparse_to_SEXP(iQ, 1 /* Free */ , -1 /* uplo="L" */ , 0, "", R_NilValue);
+  return M_chm_sparse_to_SEXP(iQ, 1 /* Free */ , -1 /* uplo="L" */ , 0, "N" /* Not unit */, R_NilValue);
 }
 
 /* Given sparse matrices A and B (sorted columns).

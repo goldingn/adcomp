@@ -1,4 +1,86 @@
 ------------------------------------------------------------------------
+TMB 1.9.10 (2023-12-12)
+------------------------------------------------------------------------
+
+o precompile(): Translation unit changes that should not be visible to
+  the user.
+
+------------------------------------------------------------------------
+TMB 1.9.9 (2023-11-27)
+------------------------------------------------------------------------
+
+o Fix 'Wformat' warnings
+
+------------------------------------------------------------------------
+TMB 1.9.7 (2023-11-22)
+------------------------------------------------------------------------
+
+o Fixed tweedie integer overflow for extreme parameters.
+
+o Added new argument 'adaptive' to 'tmbprofile'.
+
+o Added new atomic matrix functions 'sqrtm' and 'absm'.
+
+o Avoid unnecessary warnings on 'Matrix package version inconsistency'.
+
+------------------------------------------------------------------------
+TMB 1.9.6 (2023-08-11)
+------------------------------------------------------------------------
+
+o Fix UBSAN observed for nested AD contexts.
+
+------------------------------------------------------------------------
+TMB 1.9.5 (2023-07-18)
+------------------------------------------------------------------------
+
+o R: Prepare determinant() change from Matrix version 1.6-0.
+
+o R: oneStepPredict() now allows mixed discrete/continuous distributions.
+
+o C++: New atomic 'fft'.
+
+------------------------------------------------------------------------
+TMB 1.9.4 (2023-04-18)
+------------------------------------------------------------------------
+
+o Fix internal bug causing wrong 'sparse_matrix_exponential' derivatives.
+
+o Prepare for upcoming Matrix_1.5-5 (Fix misuse of Matrix C-API).
+
+------------------------------------------------------------------------
+TMB 1.9.3 (2023-03-28)
+------------------------------------------------------------------------
+
+o Prepare for Matrix 1.5-4 deprecations.
+
+o checkConsistency(): New argument 'estimate' enables full simulation
+  study and another argument 'observation.name' can be used to not
+  retape between simulation replicates.
+
+o oneStepPredict(): Eliminate nuisance warnings from generic method.
+
+o C++ side: Added preprocessor flag 'TMB_ABORT' to better control
+  behaviour in 'TMB_SAFEBOUNDS' mode (e.g. signal normal R error
+  rather than abort). In addition, 'TMB_CATCH' can now be configured
+  to catch more than just std::bad_alloc.
+
+------------------------------------------------------------------------
+TMB 1.9.2 (2023-01-23)
+------------------------------------------------------------------------
+
+o Improved interoperability with Rcpp (conflicts resolved).
+
+o Fix some broken sparse matrix coercions that used to work.
+
+o New features on C++ side:
+  - Atomic sparse matrix exponential.
+  - Atomic vectorized operations mainly for internal use.
+  - Faster matrix multiply for higher order AD (see example 'hmm_filter').
+  - Utility for parameter object concatenation.
+
+o Fix warnings from CRAN check page.
+
+------------------------------------------------------------------------
 TMB 1.9.1 (2022-08-16)
 ------------------------------------------------------------------------
 
